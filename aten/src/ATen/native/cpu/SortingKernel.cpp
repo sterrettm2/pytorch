@@ -20,6 +20,10 @@
 #include <fbgemm/Utils.h>
 #endif
 
+#if defined(CPU_CAPABILITY_AVX512)
+#include "/home/msterrett/xss/raghu/x86-simd-sort/src/x86simdsort-static-incl.h"
+#endif
+
 namespace at::native {
 
 namespace {
@@ -91,6 +95,22 @@ struct KeyValueCompDesc {
   }
 };
 
+static bool can_use_xss_sort(const TensorBase& values, const TensorBase& indices, int64_t dim, const bool stable, const bool descending) {
+  // xss_sort only works for data that is contiguous in the sorted dimension
+  if (values.stride(dim) != 1 || indices.stride(dim) != 1) return false;
+  
+  // xss_sort is not a stable sort
+  if (stable) return false;
+  
+  // xss_sort is not able to descending at the moment, since we use KV sort as its internals
+  if (descending) return false;
+  
+  auto type = values.scalar_type();
+  if (not (type == ScalarType::Long || type == ScalarType::Int || type == ScalarType::Double || type == ScalarType::Float)) return false;
+
+  return true;
+}
+
 #ifdef USE_FBGEMM
 static bool can_use_radix_sort(const TensorBase& values, const bool descending) {
   // radix_sort can be used only for 1D data
@@ -141,6 +161,65 @@ static void parallel_sort1d_kernel(
 }
 #endif
 
+#define AT_DISPATCH_CASE_XSS_TYPES(...)          \
+  AT_DISPATCH_CASE(at::ScalarType::Long, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Int, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Double, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__)
+  
+//AT_DISPATCH_CASE(at::ScalarType::Short, __VA_ARGS__)
+
+#define AT_DISPATCH_XSS_TYPES(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE_XSS_TYPES(__VA_ARGS__))
+
+#if defined(CPU_CAPABILITY_AVX512)
+static void xss_sort1d_kernel(
+    const TensorBase& values,
+    const TensorBase& indices,
+    int64_t dim) {
+  auto iter = TensorIteratorConfig()
+    .check_all_same_dtype(false)
+    .resize_outputs(false)
+    .declare_static_shape(values.sizes(), /*squash_dims=*/dim)
+    .add_output(values)
+    .add_output(indices)
+    .build();
+    
+  AT_DISPATCH_XSS_TYPES(values.scalar_type(), "xss_sort_kernel", [&] {
+    
+    auto values_dim_stride = values.stride(dim);
+    auto indices_dim_stride = indices.stride(dim);
+    auto dim_size = values.size(dim);
+  
+    auto loop = [&](char** data, const int64_t* strides, int64_t n) {
+      auto* values_data_bytes = data[0];
+      auto* indices_data_bytes = data[1];
+
+      if(values_data_bytes==nullptr || indices_data_bytes==nullptr){
+        return;
+      }
+
+      for (const auto i C10_UNUSED : c10::irange(n)) {
+        assert(values_dim_stride == 1 && indices_dim_stride == 1);
+        
+        x86simdsortStatic::keyvalue_qsort<scalar_t, int64_t>(
+            reinterpret_cast<scalar_t*>(values_data_bytes),
+            reinterpret_cast<int64_t*>(indices_data_bytes),
+            dim_size,
+            true);
+
+        values_data_bytes += strides[0];
+        indices_data_bytes += strides[1];
+      }
+    };
+    
+    int64_t grain_size = internal::GRAIN_SIZE / std::max(int64_t{1}, dim_size);
+    iter.for_each(loop, /*grain_size=*/grain_size);
+      
+  });
+}
+#endif
+
 static void sort_kernel(
     const TensorBase& self,
     const TensorBase& values,
@@ -155,6 +234,14 @@ static void sort_kernel(
     // https://github.com/pytorch/pytorch/issues/91420
     return;
   }
+
+#if defined(CPU_CAPABILITY_AVX512)
+  if (can_use_xss_sort(values, indices, dim, stable, descending)){
+    xss_sort1d_kernel(values, indices, dim);
+    return;
+  }
+#endif
+  
 #ifdef USE_FBGEMM
   if (can_use_radix_sort(values, descending)) {
     parallel_sort1d_kernel(values, indices);
@@ -243,7 +330,7 @@ static void topk_kernel(
 
 } // anonymous namespace
 
-REGISTER_DISPATCH(sort_stub, &sort_kernel);
+ALSO_REGISTER_AVX512_DISPATCH(sort_stub, &sort_kernel);
 REGISTER_DISPATCH(topk_stub, &topk_kernel);
 
 } //at::native
