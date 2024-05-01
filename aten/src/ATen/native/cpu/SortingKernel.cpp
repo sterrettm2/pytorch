@@ -16,12 +16,16 @@
 #include <ATen/native/TopKImpl.h>
 #include <c10/core/WrapDimMinimal.h>
 #include <c10/util/irange.h>
+
 #ifdef USE_FBGEMM
 #include <fbgemm/Utils.h>
 #endif
 
-#if defined(CPU_CAPABILITY_AVX512)
-#include "/home/msterrett/xss/raghu/x86-simd-sort/src/x86simdsort-static-incl.h"
+#if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2)
+
+#define XSS_COMPILE_TIME_SUPPORTED
+
+#include "/home/msterrett/xss/newperf/x86-simd-sort/src/x86simdsort-static-incl.h"
 #endif
 
 namespace at::native {
@@ -95,19 +99,23 @@ struct KeyValueCompDesc {
   }
 };
 
-static bool can_use_xss_sort(const TensorBase& values, const TensorBase& indices, int64_t dim, const bool stable, const bool descending) {
+static bool can_use_xss_sort(const TensorBase& values, const TensorBase& indices, int64_t dim, const bool stable) {
   // xss_sort only works for data that is contiguous in the sorted dimension
   if (values.stride(dim) != 1 || indices.stride(dim) != 1) return false;
   
   // xss_sort is not a stable sort
   if (stable) return false;
   
-  // xss_sort is not able to descending at the moment, since we use KV sort as its internals
-  if (descending) return false;
-  
   auto type = values.scalar_type();
   if (not (type == ScalarType::Long || type == ScalarType::Int || type == ScalarType::Double || type == ScalarType::Float)) return false;
 
+  return true;
+}
+
+static bool can_use_xss_topk(const TensorBase& values){
+  auto type = values.scalar_type();
+  if (not (type == ScalarType::Long || type == ScalarType::Int || type == ScalarType::Double || type == ScalarType::Float)) return false;
+  
   return true;
 }
 
@@ -139,6 +147,7 @@ static void parallel_sort1d_kernel(
     std::vector<int64_t> tmp_vals(elements);
     const scalar_t* sorted_keys = nullptr;
     const int64_t* sorted_vals = nullptr;
+    
     std::tie(sorted_keys, sorted_vals) = fbgemm::radix_sort_parallel(
         keys,
         vals,
@@ -166,17 +175,16 @@ static void parallel_sort1d_kernel(
   AT_DISPATCH_CASE(at::ScalarType::Int, __VA_ARGS__) \
   AT_DISPATCH_CASE(at::ScalarType::Double, __VA_ARGS__) \
   AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__)
-  
-//AT_DISPATCH_CASE(at::ScalarType::Short, __VA_ARGS__)
 
 #define AT_DISPATCH_XSS_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE_XSS_TYPES(__VA_ARGS__))
 
-#if defined(CPU_CAPABILITY_AVX512)
-static void xss_sort1d_kernel(
+#if defined(XSS_COMPILE_TIME_SUPPORTED)
+static void xss_sort_kernel(
     const TensorBase& values,
     const TensorBase& indices,
-    int64_t dim) {
+    int64_t dim,
+    bool descending) {
   auto iter = TensorIteratorConfig()
     .check_all_same_dtype(false)
     .resize_outputs(false)
@@ -206,7 +214,8 @@ static void xss_sort1d_kernel(
             reinterpret_cast<scalar_t*>(values_data_bytes),
             reinterpret_cast<int64_t*>(indices_data_bytes),
             dim_size,
-            true);
+            true,
+            descending);
 
         values_data_bytes += strides[0];
         indices_data_bytes += strides[1];
@@ -235,9 +244,9 @@ static void sort_kernel(
     return;
   }
 
-#if defined(CPU_CAPABILITY_AVX512)
-  if (can_use_xss_sort(values, indices, dim, stable, descending)){
-    xss_sort1d_kernel(values, indices, dim);
+#if defined(XSS_COMPILE_TIME_SUPPORTED)
+  if (can_use_xss_sort(values, indices, dim, stable)){
+    xss_sort_kernel(values, indices, dim, descending);
     return;
   }
 #endif
@@ -288,6 +297,57 @@ static void sort_kernel(
   );
 }
 
+#if defined(XSS_COMPILE_TIME_SUPPORTED)
+template <typename scalar_t, typename index_t>
+void xss_topk_loop(
+    const int64_t mode_values_stride,
+    const int64_t mode_indices_stride,
+    const int64_t tmp_values_stride,
+    const int64_t k,
+    const int64_t dim_size,
+    const bool largest,
+    const bool sorted,
+    char** data, const int64_t* strides, const int64_t n) {
+
+  // If k is zero, then output values and indices are empty tensors
+  // So iterating over other dims is pointless
+  if (k <= 0) {
+    return;
+  }
+
+  std::vector<scalar_t> tmp_values(dim_size);
+  std::vector<index_t> tmp_indices(dim_size);
+  
+  for (const auto i : c10::irange(n)) {
+    TensorAccessor<scalar_t, 1> mode_values_acc(
+        reinterpret_cast<scalar_t*>(data[0] + i * strides[0]),
+        &k, &mode_values_stride);
+    TensorAccessor<index_t, 1> mode_indices_acc(
+        reinterpret_cast<index_t*>(data[1] + i * strides[1]),
+        &k, &mode_indices_stride);
+    TensorAccessor<const scalar_t, 1> tmp_values_acc(
+        reinterpret_cast<scalar_t*>(data[2] + i * strides[2]),
+        &dim_size, &tmp_values_stride);
+
+    for (const auto j : c10::irange(dim_size)) {
+      tmp_values[j] = tmp_values_acc[j];
+      tmp_indices[j] = j;
+    }
+
+    if (sorted){
+        x86simdsortStatic::keyvalue_partial_sort(tmp_values.data(), tmp_indices.data(), k, dim_size, true, largest);
+    }else{
+        x86simdsortStatic::keyvalue_select(tmp_values.data(), tmp_indices.data(), k - 1, dim_size, true, largest);
+    }
+
+    for (const auto j : c10::irange(k)) {
+      mode_values_acc[j] = tmp_values[j];
+      mode_indices_acc[j] = tmp_indices[j];
+    }
+  }
+}
+#endif
+
 static void topk_kernel(
     const TensorBase &values,
     const TensorBase &indices,
@@ -296,6 +356,7 @@ static void topk_kernel(
     int64_t dim,
     bool largest,
     bool sorted) {
+        
   auto sizes = self.sizes();
   auto iter = TensorIteratorConfig()
     .check_all_same_dtype(false)
@@ -309,6 +370,23 @@ static void topk_kernel(
   auto mode_values_stride = values.strides()[dim];
   auto mode_indices_stride = indices.strides()[dim];
   auto tmp_values_stride = self.strides()[dim];
+  
+        
+#if defined(XSS_COMPILE_TIME_SUPPORTED) 
+  if (can_use_xss_topk(self)){
+    AT_DISPATCH_XSS_TYPES(self.scalar_type(), "xss_topk_cpu", [&] {
+      auto loop = [&](char** data, const int64_t* strides, int64_t n) {
+        return xss_topk_loop<scalar_t, int64_t>(
+            mode_values_stride, mode_indices_stride, tmp_values_stride,
+            k, sizes[dim], largest, sorted, data, strides, n);
+      };
+
+      int64_t grain_size = internal::GRAIN_SIZE / std::max(int64_t{1}, sizes[dim]);
+      iter.for_each(loop, /*grain_size=*/grain_size);
+    });
+    return;
+  }
+#endif
 
   AT_DISPATCH_ALL_TYPES_AND2(ScalarType::BFloat16, ScalarType::Half, self.scalar_type(), "topk_cpu", [&] {
     auto loop = [&](char** data, const int64_t* strides, int64_t n) {
@@ -331,6 +409,6 @@ static void topk_kernel(
 } // anonymous namespace
 
 ALSO_REGISTER_AVX512_DISPATCH(sort_stub, &sort_kernel);
-REGISTER_DISPATCH(topk_stub, &topk_kernel);
+ALSO_REGISTER_AVX512_DISPATCH(topk_stub, &topk_kernel);
 
 } //at::native
