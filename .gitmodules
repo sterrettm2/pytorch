@@ -132,3 +132,7 @@
 	path = third_party/cpp-httplib
 	url = https://github.com/yhirose/cpp-httplib.git
 	branch = v0.15.3
+[submodule "third_party/x86-simd-sort"]
+	path = third_party/x86-simd-sort
+	url = https://github.com/sterrettm2/x86-simd-sort.git
+	branch = kv-select

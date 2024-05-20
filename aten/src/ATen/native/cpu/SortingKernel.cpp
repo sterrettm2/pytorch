@@ -25,7 +25,7 @@
 
 #define XSS_COMPILE_TIME_SUPPORTED
 
-#include "/home/msterrett/xss/newperf/x86-simd-sort/src/x86simdsort-static-incl.h"
+#include <src/x86simdsort-static-incl.h>
 #endif
 
 namespace at::native {
@@ -100,12 +100,9 @@ struct KeyValueCompDesc {
 };
 
 static bool can_use_xss_sort(const TensorBase& values, const TensorBase& indices, int64_t dim, const bool stable) {
-  // xss_sort only works for data that is contiguous in the sorted dimension
-  if (values.stride(dim) != 1 || indices.stride(dim) != 1) return false;
-  
   // xss_sort is not a stable sort
   if (stable) return false;
-  
+
   auto type = values.scalar_type();
   if (not (type == ScalarType::Long || type == ScalarType::Int || type == ScalarType::Double || type == ScalarType::Float)) return false;
 
@@ -115,7 +112,7 @@ static bool can_use_xss_sort(const TensorBase& values, const TensorBase& indices
 static bool can_use_xss_topk(const TensorBase& values){
   auto type = values.scalar_type();
   if (not (type == ScalarType::Long || type == ScalarType::Int || type == ScalarType::Double || type == ScalarType::Float)) return false;
-  
+
   return true;
 }
 
@@ -147,7 +144,7 @@ static void parallel_sort1d_kernel(
     std::vector<int64_t> tmp_vals(elements);
     const scalar_t* sorted_keys = nullptr;
     const int64_t* sorted_vals = nullptr;
-    
+
     std::tie(sorted_keys, sorted_vals) = fbgemm::radix_sort_parallel(
         keys,
         vals,
@@ -192,13 +189,15 @@ static void xss_sort_kernel(
     .add_output(values)
     .add_output(indices)
     .build();
-    
+
+  using index_t = int64_t;
+
   AT_DISPATCH_XSS_TYPES(values.scalar_type(), "xss_sort_kernel", [&] {
-    
+
     auto values_dim_stride = values.stride(dim);
     auto indices_dim_stride = indices.stride(dim);
     auto dim_size = values.size(dim);
-  
+
     auto loop = [&](char** data, const int64_t* strides, int64_t n) {
       auto* values_data_bytes = data[0];
       auto* indices_data_bytes = data[1];
@@ -207,25 +206,103 @@ static void xss_sort_kernel(
         return;
       }
 
-      for (const auto i C10_UNUSED : c10::irange(n)) {
-        assert(values_dim_stride == 1 && indices_dim_stride == 1);
-        
-        x86simdsortStatic::keyvalue_qsort<scalar_t, int64_t>(
-            reinterpret_cast<scalar_t*>(values_data_bytes),
-            reinterpret_cast<int64_t*>(indices_data_bytes),
-            dim_size,
-            true,
-            descending);
+      if (values_dim_stride == 1 && indices_dim_stride == 1){
+        for (const auto i C10_UNUSED : c10::irange(n)) {
+          x86simdsortStatic::keyvalue_qsort<scalar_t, index_t>(
+              reinterpret_cast<scalar_t*>(values_data_bytes),
+              reinterpret_cast<index_t*>(indices_data_bytes),
+              dim_size,
+              true,
+              descending);
 
-        values_data_bytes += strides[0];
-        indices_data_bytes += strides[1];
+          values_data_bytes += strides[0];
+          indices_data_bytes += strides[1];
+        }
+      }else{
+        std::vector<scalar_t> tmp_values(dim_size);
+        std::vector<index_t> tmp_indices(dim_size);
+
+        for (const auto i : c10::irange(n)) {
+          TensorAccessor<scalar_t, 1> mode_values_acc(
+              reinterpret_cast<scalar_t*>(data[0] + i * strides[0]),
+              &dim_size, &values_dim_stride);
+          TensorAccessor<index_t, 1> mode_indices_acc(
+              reinterpret_cast<index_t*>(data[1] + i * strides[1]),
+              &dim_size, &indices_dim_stride);
+
+          for (const auto j : c10::irange(dim_size)) {
+            tmp_values[j] = mode_values_acc[j];
+            tmp_indices[j] = j;
+          }
+
+          x86simdsortStatic::keyvalue_qsort<scalar_t, index_t>(
+              tmp_values.data(),
+              tmp_indices.data(),
+              dim_size,
+              true,
+              descending);
+
+          for (const auto j : c10::irange(dim_size)) {
+            mode_values_acc[j] = tmp_values[j];
+            mode_indices_acc[j] = tmp_indices[j];
+          }
+        }
       }
     };
-    
+
     int64_t grain_size = internal::GRAIN_SIZE / std::max(int64_t{1}, dim_size);
     iter.for_each(loop, /*grain_size=*/grain_size);
-      
+
   });
+}
+
+template <typename scalar_t, typename index_t>
+void xss_topk_loop(
+    const int64_t mode_values_stride,
+    const int64_t mode_indices_stride,
+    const int64_t tmp_values_stride,
+    const int64_t k,
+    const int64_t dim_size,
+    const bool largest,
+    const bool sorted,
+    char** data, const int64_t* strides, const int64_t n) {
+
+  // If k is zero, then output values and indices are empty tensors
+  // So iterating over other dims is pointless
+  if (k <= 0) {
+    return;
+  }
+
+  std::vector<scalar_t> tmp_values(dim_size);
+  std::vector<index_t> tmp_indices(dim_size);
+
+  for (const auto i : c10::irange(n)) {
+    TensorAccessor<scalar_t, 1> mode_values_acc(
+        reinterpret_cast<scalar_t*>(data[0] + i * strides[0]),
+        &k, &mode_values_stride);
+    TensorAccessor<index_t, 1> mode_indices_acc(
+        reinterpret_cast<index_t*>(data[1] + i * strides[1]),
+        &k, &mode_indices_stride);
+    TensorAccessor<const scalar_t, 1> tmp_values_acc(
+        reinterpret_cast<scalar_t*>(data[2] + i * strides[2]),
+        &dim_size, &tmp_values_stride);
+
+    for (const auto j : c10::irange(dim_size)) {
+      tmp_values[j] = tmp_values_acc[j];
+      tmp_indices[j] = j;
+    }
+
+    if (sorted){
+      x86simdsortStatic::keyvalue_partial_sort(tmp_values.data(), tmp_indices.data(), k, dim_size, true, largest);
+    }else{
+      x86simdsortStatic::keyvalue_select(tmp_values.data(), tmp_indices.data(), k - 1, dim_size, true, largest);
+    }
+
+    for (const auto j : c10::irange(k)) {
+      mode_values_acc[j] = tmp_values[j];
+      mode_indices_acc[j] = tmp_indices[j];
+    }
+  }
 }
 #endif
 
@@ -250,7 +327,7 @@ static void sort_kernel(
     return;
   }
 #endif
-  
+
 #ifdef USE_FBGEMM
   if (can_use_radix_sort(values, descending)) {
     parallel_sort1d_kernel(values, indices);
@@ -297,57 +374,6 @@ static void sort_kernel(
   );
 }
 
-#if defined(XSS_COMPILE_TIME_SUPPORTED)
-template <typename scalar_t, typename index_t>
-void xss_topk_loop(
-    const int64_t mode_values_stride,
-    const int64_t mode_indices_stride,
-    const int64_t tmp_values_stride,
-    const int64_t k,
-    const int64_t dim_size,
-    const bool largest,
-    const bool sorted,
-    char** data, const int64_t* strides, const int64_t n) {
-
-  // If k is zero, then output values and indices are empty tensors
-  // So iterating over other dims is pointless
-  if (k <= 0) {
-    return;
-  }
-
-  std::vector<scalar_t> tmp_values(dim_size);
-  std::vector<index_t> tmp_indices(dim_size);
-  
-  for (const auto i : c10::irange(n)) {
-    TensorAccessor<scalar_t, 1> mode_values_acc(
-        reinterpret_cast<scalar_t*>(data[0] + i * strides[0]),
-        &k, &mode_values_stride);
-    TensorAccessor<index_t, 1> mode_indices_acc(
-        reinterpret_cast<index_t*>(data[1] + i * strides[1]),
-        &k, &mode_indices_stride);
-    TensorAccessor<const scalar_t, 1> tmp_values_acc(
-        reinterpret_cast<scalar_t*>(data[2] + i * strides[2]),
-        &dim_size, &tmp_values_stride);
-
-    for (const auto j : c10::irange(dim_size)) {
-      tmp_values[j] = tmp_values_acc[j];
-      tmp_indices[j] = j;
-    }
-
-    if (sorted){
-        x86simdsortStatic::keyvalue_partial_sort(tmp_values.data(), tmp_indices.data(), k, dim_size, true, largest);
-    }else{
-        x86simdsortStatic::keyvalue_select(tmp_values.data(), tmp_indices.data(), k - 1, dim_size, true, largest);
-    }
-
-    for (const auto j : c10::irange(k)) {
-      mode_values_acc[j] = tmp_values[j];
-      mode_indices_acc[j] = tmp_indices[j];
-    }
-  }
-}
-#endif
-
 static void topk_kernel(
     const TensorBase &values,
     const TensorBase &indices,
@@ -356,7 +382,7 @@ static void topk_kernel(
     int64_t dim,
     bool largest,
     bool sorted) {
-        
+
   auto sizes = self.sizes();
   auto iter = TensorIteratorConfig()
     .check_all_same_dtype(false)
@@ -370,9 +396,8 @@ static void topk_kernel(
   auto mode_values_stride = values.strides()[dim];
   auto mode_indices_stride = indices.strides()[dim];
   auto tmp_values_stride = self.strides()[dim];
-  
-        
-#if defined(XSS_COMPILE_TIME_SUPPORTED) 
+
+#if defined(XSS_COMPILE_TIME_SUPPORTED)
   if (can_use_xss_topk(self)){
     AT_DISPATCH_XSS_TYPES(self.scalar_type(), "xss_topk_cpu", [&] {
       auto loop = [&](char** data, const int64_t* strides, int64_t n) {
