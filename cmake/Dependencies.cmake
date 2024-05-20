@@ -1386,6 +1386,12 @@ if(CAFFE2_CMAKE_BUILDING_WITH_MAIN_REPO AND NOT INTERN_DISABLE_ONNX)
   set(BUILD_SHARED_LIBS ${TEMP_BUILD_SHARED_LIBS})
 endif()
 
+# --[ x86-simd-sort integration
+if(USE_X86_SIMD_SORT)
+  set(XSS_SIMD_SORT_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../third_party/x86-simd-sort)
+  include_directories(SYSTEM ${XSS_SIMD_SORT_INCLUDE_DIR})
+endif()
+
 # --[ ATen checks
 set(USE_LAPACK 0)
 
